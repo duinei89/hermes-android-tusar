@@ -4,13 +4,25 @@ This document is for an AI agent, automation service, desktop companion, or
 Android-hosted assistant that needs to drive Hermes bytecode analysis through
 `libtusar.so`.
 
-The library is intentionally exposed as a small protocol:
+The library is intentionally exposed in two equivalent layers:
 
 ```text
+Direct Kotlin JNI methods:
+openHermesFile(path) -> handle
+getMetadata(handle) -> responseJson
+listFunctions(handle) -> responseJson
+...
+closeHermesFile(handle)
+
+Generic escape hatch:
 nativeOpen(path) -> handle
 nativeCall(handle, operation, argumentsJson) -> responseJson
 nativeClose(handle)
 ```
+
+The direct methods are ergonomic aliases over the same native session registry
+and dispatcher. Use them for common app flows; use `nativeCall` for the complete
+surface and future upstream commands.
 
 An agent should treat the native library as a stateful tool server. It should
 not infer results from filenames or reimplement HBC parsing in the model.
@@ -18,6 +30,22 @@ not infer results from filenames or reimplement HBC parsing in the model.
 ## Agent contract
 
 ### Initialization
+
+For a Kotlin host, the common direct API is:
+
+```kotlin
+val handle = HermesNative.openHermesFile(path)
+try {
+    val metadata = JSONObject(HermesNative.getMetadata(handle))
+    val functions = JSONObject(HermesNative.listFunctions(handle))
+    val code = JSONObject(HermesNative.decompileFunction(handle, 42))
+} finally {
+    HermesNative.closeHermesFile(handle)
+}
+```
+
+`generateFridaHooks` and `patchFunction` are also first-class direct methods.
+All direct results use the same `{ok,result}` / `{ok:false,error}` envelope.
 
 1. Confirm the ABI library is packaged and loaded.
 2. Copy the input bundle to an app-private filesystem path if it came from an

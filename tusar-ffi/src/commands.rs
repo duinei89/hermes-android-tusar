@@ -247,7 +247,11 @@ fn dependencies(session: &mut Session, args: &Value) -> Result<Value, Value> {
         .pipeline_ctx
         .as_ref()
         .ok_or_else(|| error("DECOMPILER_ERROR", "Pipeline was not initialized"))?;
-    let tree = pipeline.registry.get_dependency_tree(module_id, depth);
+    let tree = hbc_decomp::analysis::metro::DependencyGraph::get_dependency_tree(
+        &pipeline.registry,
+        module_id,
+        depth,
+    );
     Ok(ok(tree.format(0)))
 }
 
@@ -289,7 +293,7 @@ fn dump(session: &Session, args: &Value) -> Value {
 
 fn dump_table(session: &Session, args: &Value) -> Result<Value, Value> {
     let kind = required_string(args, "kind")?;
-    let table_kind = hbc_decomp::TableKind::parse(&kind)
+    let table_kind = hbc_decomp::inspect::TableKind::parse(&kind)
         .ok_or_else(|| error("INVALID_ARGUMENT", format!("Unknown table kind: {kind}")))?;
     if bool_arg(args, "json", false) {
         Ok(ok(hbc_decomp::dump_table_json(&session.file, table_kind)))
@@ -311,6 +315,155 @@ fn graphviz(session: &Session, args: &Value) -> Result<Value, Value> {
         .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
     let name = function_name(&session.file, function_id as usize);
     Ok(ok(hbc_decomp::ir::generate_dot(&cfg, &name)))
+}
+
+fn debug_info(session: &Session) -> Result<Value, Value> {
+    let offset = session.file.header.debug_info_offset;
+    let parsed = hbc_decomp::DebugInfo::parse(&session.bytes, offset)
+        .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+    let scopes = parsed
+        .scope_descriptors
+        .iter()
+        .map(|scope| {
+            json!({
+                "offset": scope.offset,
+                "parentOffset": scope.parent_offset,
+                "flags": scope.flags,
+                "inner": scope.is_inner_scope(),
+                "dynamic": scope.is_dynamic(),
+                "names": scope.names,
+            })
+        })
+        .collect::<Vec<_>>();
+    let callees = parsed
+        .textified_callees
+        .iter()
+        .map(|(offset, name)| json!({"offset": offset, "name": name}))
+        .collect::<Vec<_>>();
+    let variables = parsed
+        .all_variable_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(ok(json!({
+        "debugInfoOffset": offset,
+        "scopes": scopes,
+        "callees": callees,
+        "variables": variables,
+        "stringTable": parsed.string_table,
+    })))
+}
+
+fn extract_modules(session: &mut Session, args: &Value) -> Result<Value, Value> {
+    let output_dir = required_string(args, "output_dir")?;
+    session_error(session.ensure_pipeline())?;
+    let pipeline = session
+        .pipeline_ctx
+        .as_ref()
+        .ok_or_else(|| error("DECOMPILER_ERROR", "Pipeline was not initialized"))?;
+    let directory = Path::new(&output_dir);
+    std::fs::create_dir_all(directory)
+        .map_err(|e| error("IO_ERROR", format!("Failed to create {output_dir}: {e}")))?;
+    let mut files = Vec::new();
+    for module in pipeline.registry.modules.values() {
+        let filename = module
+            .name
+            .as_deref()
+            .map(|name| name.replace(['/', '\\\\'], "_"))
+            .map(|name| format!("{}_{}.js", module.module_id, name))
+            .unwrap_or_else(|| format!("module_{}.js", module.module_id));
+        let mut content = format!(
+            "// Module ID: {}\\n// Function ID: {}\\n",
+            module.module_id, module.function_id
+        );
+        if let Some(name) = &module.name {
+            content.push_str(&format!("// Name: {name}\\n"));
+        }
+        content.push_str(&format!("// Dependencies: {:?}\\n\\n", module.dependencies));
+        content.push_str(&pipeline.generate_function_code(&session.file, module.function_id));
+        std::fs::write(directory.join(&filename), content)
+            .map_err(|e| error("IO_ERROR", format!("Failed to write {filename}: {e}")))?;
+        files.push(filename);
+    }
+    Ok(ok(json!({"outputDir": output_dir, "count": files.len(), "files": files})))
+}
+
+fn binary_diff(session: &Session, args: &Value) -> Result<Value, Value> {
+    let other_path = required_string(args, "other_path")?;
+    let other_bytes = std::fs::read(&other_path)
+        .map_err(|e| error("IO_ERROR", format!("Failed to read {other_path}: {e}")))?;
+    let other_file = BytecodeFile::parse_auto(&other_bytes)
+        .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+    let (other_format, _) = hbc_decomp::BytecodeFormat::for_version_or_latest(other_file.header.version)
+        .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+
+    let names = |file: &BytecodeFile| {
+        file.function_headers
+            .iter()
+            .enumerate()
+            .map(|(id, header)| (function_name(file, id), id as u32))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let left = names(&session.file);
+    let right = names(&other_file);
+    let mut all = std::collections::BTreeSet::new();
+    all.extend(left.keys().cloned());
+    all.extend(right.keys().cloned());
+    let options = DisasmOptions {
+        show_offsets: false,
+        show_labels: true,
+        resolve_strings: true,
+        enable_color: false,
+    };
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+    let mut identical = 0u32;
+    for name in all {
+        match (left.get(&name), right.get(&name)) {
+            (Some(&left_id), Some(&right_id)) => {
+                let left_code = hbc_decomp::disassemble_function(&session.file, &session.format, left_id, &options)
+                    .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+                let right_code = hbc_decomp::disassemble_function(&other_file, &other_format, right_id, &options)
+                    .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+                if left_code == right_code {
+                    identical += 1;
+                } else {
+                    modified.push(json!({"name": name, "leftFunctionId": left_id, "rightFunctionId": right_id}));
+                }
+            }
+            (Some(&left_id), None) => removed.push(json!({"name": name, "functionId": left_id})),
+            (None, Some(&right_id)) => added.push(json!({"name": name, "functionId": right_id})),
+            (None, None) => {}
+        }
+    }
+    Ok(ok(json!({
+        "otherPath": other_path,
+        "identical": identical,
+        "modified": modified,
+        "removed": removed,
+        "added": added,
+    })))
+}
+
+fn asm_check(session: &Session, args: &Value) -> Result<Value, Value> {
+    let function_id = required_u32(args, "function_id")?;
+    let text = hbc_decomp::emit_hasm_function(&session.file, &session.format, function_id)
+        .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+    let parsed = hbc_decomp::parse_hasm_with_context(&text, &session.format, &session.file)
+        .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
+    let original = session.file.decode_function_instructions(&session.format, function_id)
+        .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+    let original_bytes = hbc_decomp::encode_function_body(&session.format, &original)
+        .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
+    let roundtrip_bytes = hbc_decomp::encode_function_body(&session.format, &parsed)
+        .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
+    Ok(ok(json!({
+        "functionId": function_id,
+        "match": original_bytes == roundtrip_bytes,
+        "originalBytes": original_bytes.len(),
+        "roundtripBytes": roundtrip_bytes.len(),
+    })))
 }
 
 fn callgraph(session: &Session, args: &Value) -> Result<Value, Value> {
@@ -532,7 +685,7 @@ pub fn dispatch(session: Option<&mut Session>, command: &str, arguments: Value) 
             .map(decompile_all)
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
-        "xref" | "search-strings" | "search-functions" => session
+        "xref" | "search-strings" | "searchStrings" | "search-functions" | "searchFunctions" => session
             .map(|session| xrefs(session, &arguments))
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
@@ -548,6 +701,27 @@ pub fn dispatch(session: Option<&mut Session>, command: &str, arguments: Value) 
             .map(|session| closures(session, &arguments))
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
+        "debug" | "debug-info" => session
+            .map(debug_info)
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "extract" => session
+            .map(|session| extract_modules(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "bin-diff" | "binary-diff" => session
+            .map(|session| binary_diff(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "asm" => session
+            .map(|session| patch_function(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "asm-check" => session
+            .map(|session| asm_check(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "tui" => error("CLI_ONLY", "The terminal UI is not available inside an Android app; use info, modules, disasm, decompile, graphviz, and callgraph instead"),
         "dump" => session
             .map(|session| dump(session, &arguments))
             .unwrap_or_else(|| error("INVALID_HANDLE", "A session is required")),

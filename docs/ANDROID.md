@@ -92,55 +92,54 @@ all four when you need broad emulator and legacy-device support.
 Android Gradle Plugin normally packages `src/main/jniLibs` automatically. No
 CMake or `externalNativeBuild` block is needed for this prebuilt library.
 
-## Kotlin wrapper
+## Direct Kotlin API
 
-Create a small wrapper so the rest of the app does not manually construct JSON:
+Copy [`../android/src/main/java/com/tusar/hermes/HermesNative.kt`](../android/src/main/java/com/tusar/hermes/HermesNative.kt)
+into your app. It declares the complete direct JNI surface requested by Android
+clients:
 
 ```kotlin
-package com.tusar.hermes
-
-import org.json.JSONObject
-
-object HermesNative {
-    init {
-        System.loadLibrary("tusar")
-    }
-
-    external fun nativeVersion(): String
-    external fun nativeOpen(path: String): Long
-    external fun nativeClose(handle: Long)
-    external fun nativeCall(
-        handle: Long,
-        operation: String,
-        argumentsJson: String,
-    ): String
-
-    fun call(handle: Long, operation: String, arguments: JSONObject = JSONObject()): JSONObject {
-        return JSONObject(nativeCall(handle, operation, arguments.toString()))
-    }
+val handle = HermesNative.openHermesFile(hbcFile.absolutePath)
+check(handle > 0)
+try {
+    val metadata = JSONObject(HermesNative.getMetadata(handle))
+    val functions = JSONObject(HermesNative.listFunctions(handle))
+    val disassembly = JSONObject(HermesNative.disassembleFunction(handle, 42))
+    val source = JSONObject(HermesNative.decompileFunction(handle, 42))
+    val stringRefs = JSONObject(HermesNative.searchStrings(handle, "login"))
+    val functionRefs = JSONObject(HermesNative.searchFunctions(handle, "42"))
+    val cfg = JSONObject(HermesNative.getControlFlowGraph(handle, 42))
+    val secretReport = JSONObject(HermesNative.scanSecrets(handle))
+} finally {
+    HermesNative.closeHermesFile(handle)
 }
+```
 
-class HermesSession(private val hbcPath: String) : AutoCloseable {
-    private var handle: Long = 0
+The direct methods are:
 
-    fun open() {
-        check(handle == 0L) { "Session is already open" }
-        handle = HermesNative.nativeOpen(hbcPath)
-        check(handle > 0) { "Unable to read or parse Hermes bytecode: $hbcPath" }
-    }
+- `openHermesFile(path): Long`
+- `getMetadata(handle): String`
+- `listFunctions(handle): String`
+- `disassembleFunction(handle, functionId): String`
+- `decompileFunction(handle, functionId): String`
+- `searchStrings(handle, query): String`
+- `searchFunctions(handle, query): String`
+- `getControlFlowGraph(handle, functionId): String`
+- `scanSecrets(handle): String`
+- `generateFridaHooks(handle, moduleId, outputDir, exports): String`
+- `patchFunction(handle, functionId, hasm, outputPath): String`
+- `closeHermesFile(handle)`
 
-    fun call(operation: String, arguments: JSONObject = JSONObject()): JSONObject {
-        check(handle > 0) { "Session is not open" }
-        return HermesNative.call(handle, operation, arguments)
-    }
+The direct methods return the same JSON envelope as `nativeCall`, which means
+Kotlin can use one response parser. The included `HermesSession` wraps lifecycle
+and adds convenience methods. For all other operations—`extract`, `bin-diff`,
+`asm-check`, `create`, `dump`, `callgraph`, and future upstream features—use
+`HermesNative.call(handle, operation, arguments)`.
 
-    override fun close() {
-        if (handle > 0) {
-            HermesNative.nativeClose(handle)
-            handle = 0
-        }
-    }
-}
+The generic declarations are still available:
+
+```kotlin
+external fun nativeCall(handle: Long, operation: String, argumentsJson: String): String
 ```
 
 Use it off the main thread:
@@ -202,6 +201,10 @@ to `filesDir` or `cacheDir`. Use canonical paths and avoid passing untrusted
 path strings directly to write operations.
 
 ## Command protocol
+
+The complete native command surface is callable from Kotlin through
+`HermesNative.call`. The direct methods above are ergonomic aliases, not a
+separate implementation.
 
 Every command is a string plus a JSON object. A successful response has:
 

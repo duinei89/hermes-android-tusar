@@ -31,13 +31,11 @@ or HASM; they do not turn decompiled JavaScript back into a bundle.
 | Area | Operations |
 |---|---|
 | File and functions | `info`, `list-functions`, `list-versions` |
-| Read and decompile | `disasm`, `decompile`, `decompile-full`, `decompile-all` |
-| Metro analysis | `modules`, `deps` / `module-deps` |
-| Cross-references | `xref`, `search-strings`, `search-functions` |
-| Graphs | `graph`, `graphviz`, `callgraph` |
-| IR and structure | `closures`, `dump`, `dump-table` |
-| Security/RE helpers | `secrets`, `frida-hooks` |
-| Bytecode writing | `emit-hasm`, `patch-string`, `patch-function`, `inject-stub`, `create` |
+| Read | `info`, `list-functions`, `disasm`, `decompile`, `decompile-full`, `decompile-all`, `extract`, `modules`, `deps` |
+| Analyze | `xref`, `search-strings`, `search-functions`, `graphviz`, `callgraph`, `closures`, `debug`, `dump`, `dump-table`, `bin-diff` |
+| RE helpers | `secrets`, `frida-hooks` |
+| Bytecode writing | `emit-hasm`, `asm`, `asm-check`, `patch-string`, `patch-function`, `inject-stub`, `create` |
+| CLI-only | `tui` returns a structured `CLI_ONLY` error; use the equivalent JSON operations in Android |
 
 The complete protocol, argument schema, examples, and agent guidance are in:
 
@@ -84,28 +82,35 @@ Then load it with:
 System.loadLibrary("tusar")
 ```
 
-### 3. Declare the JNI methods
+### 3. Add the direct Kotlin facade
 
-The exported class name is fixed by the Rust symbol names:
+The repository includes a drop-in wrapper at
+[`android/src/main/java/com/tusar/hermes/HermesNative.kt`](android/src/main/java/com/tusar/hermes/HermesNative.kt).
+Copy it into your app (or use it as the source for your own package). It exposes
+these direct methods:
 
 ```kotlin
-package com.tusar.hermes
-
-object HermesNative {
-    init {
-        System.loadLibrary("tusar")
-    }
-
-    external fun nativeVersion(): String
-    external fun nativeOpen(path: String): Long
-    external fun nativeClose(handle: Long)
-    external fun nativeCall(
-        handle: Long,
-        operation: String,
-        argumentsJson: String,
-    ): String
-}
+val handle = HermesNative.openHermesFile(path)
+val metadata = JSONObject(HermesNative.getMetadata(handle))
+val functions = JSONObject(HermesNative.listFunctions(handle))
+val disassembly = JSONObject(HermesNative.disassembleFunction(handle, 42))
+val source = JSONObject(HermesNative.decompileFunction(handle, 42))
+val strings = JSONObject(HermesNative.searchStrings(handle, "login"))
+val references = JSONObject(HermesNative.searchFunctions(handle, "42"))
+val cfgDot = JSONObject(HermesNative.getControlFlowGraph(handle, 42))
+val secrets = JSONObject(HermesNative.scanSecrets(handle))
+HermesNative.closeHermesFile(handle)
 ```
+
+`generateFridaHooks` and `patchFunction` are direct methods too. Every direct
+analysis/write method returns the same JSON envelope as `nativeCall`, so callers
+can use one parser and one error policy. The facade also provides typed-looking
+Kotlin helpers for every remaining command (`modules`, `extractModules`,
+`binaryDiff`, `emitHasm`, `assembleFunction`, `checkAssembly`, `createFile`,
+and more). Keep the generic `nativeCall` escape hatch for new upstream commands.
+
+The exported class name is `com.tusar.hermes.HermesNative`; if you move the
+Kotlin class to another package, the Rust JNI symbol names must be regenerated.
 
 The `nativeVersion()` response is currently:
 
