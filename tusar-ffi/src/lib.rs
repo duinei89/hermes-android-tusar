@@ -7,12 +7,23 @@ use jni::{
     sys::jstring,
     JNIEnv,
 };
+use parking_lot::RwLock;
 use serde_json::{json, Value};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 use crate::session::{Session, SessionStore};
 
 static STORE: OnceLock<SessionStore> = OnceLock::new();
+static LAST_ERROR: OnceLock<RwLock<String>> = OnceLock::new();
+
+fn last_error() -> &'static RwLock<String> {
+    LAST_ERROR.get_or_init(|| RwLock::new(String::new()))
+}
+
+fn set_last_error(message: impl Into<String>) {
+    *last_error().write() = message.into();
+}
 
 fn store() -> &'static SessionStore {
     STORE.get_or_init(SessionStore::new)
@@ -40,21 +51,42 @@ fn read_jstring(env: &mut JNIEnv, value: &JString, name: &str) -> Result<String,
 }
 
 fn open_path(path: String) -> i64 {
-    if path.is_empty() {
+    match catch_unwind(AssertUnwindSafe(|| open_path_impl(path))) {
+        Ok(handle) => handle,
+        Err(_) => {
+            set_last_error("Native parser panicked while opening the input");
+            0
+        }
+    }
+}
+
+fn open_path_impl(path: String) -> i64 {
+    set_last_error("");
+    if path.trim().is_empty() {
+        set_last_error("Input path is empty");
         return 0;
     }
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(_) => return 0,
+        Err(error) => {
+            set_last_error(format!("Cannot read input: {error}"));
+            return 0;
+        }
     };
     let file = match BytecodeFile::parse_auto(&bytes) {
         Ok(file) => file,
-        Err(_) => return 0,
+        Err(error) => {
+            set_last_error(format!("Cannot parse Hermes bytecode: {error}"));
+            return 0;
+        }
     };
     let format = match BytecodeFormat::for_version_or_latest(file.header.version) {
         Ok((format, _)) => format,
-        Err(_) => return 0,
+        Err(error) => {
+            set_last_error(format!("Unsupported HBC version {}: {error}", file.header.version));
+            return 0;
+        }
     };
 
     let handle = store().insert(Session {
@@ -64,7 +96,13 @@ fn open_path(path: String) -> i64 {
         format,
         pipeline_ctx: None,
     });
-    i64::try_from(handle).unwrap_or(0)
+    match i64::try_from(handle) {
+        Ok(handle) => handle,
+        Err(_) => {
+            set_last_error("Session handle overflow");
+            0
+        }
+    }
 }
 
 fn dispatch_command(handle: i64, operation: &str, arguments: Value) -> Value {
@@ -85,7 +123,10 @@ fn dispatch_command(handle: i64, operation: &str, arguments: Value) -> Value {
 }
 
 fn call_json(handle: i64, operation: &str, arguments: Value) -> String {
-    dispatch_command(handle, operation, arguments).to_string()
+    match catch_unwind(AssertUnwindSafe(|| dispatch_command(handle, operation, arguments))) {
+        Ok(response) => response.to_string(),
+        Err(_) => json_error("PANIC", "Native operation failed unexpectedly; no output was written"),
+    }
 }
 
 /// Kotlin/Java class: com.tusar.hermes.HermesNative
@@ -111,6 +152,15 @@ pub extern "system" fn Java_com_tusar_hermes_HermesNative_nativeOpen(
         Err(_) => return 0,
     };
     open_path(path)
+}
+
+/// Kotlin method: external fun nativeLastError(): String
+#[no_mangle]
+pub extern "system" fn Java_com_tusar_hermes_HermesNative_nativeLastError(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_string(env, last_error().read().clone())
 }
 
 /// Kotlin method: external fun nativeClose(handle: Long)

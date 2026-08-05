@@ -1,8 +1,14 @@
 use hbc_decomp::{BytecodeFile, DecompileOptionsV2, DisasmOptions};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::session::Session;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn ok(result: impl Into<Value>) -> Value {
     json!({"ok": true, "result": result.into()})
@@ -101,6 +107,119 @@ fn list_functions(session: &Session, args: &Value) -> Value {
         })
         .collect();
     ok(json!({"total": file.function_headers.len(), "functions": functions}))
+}
+
+// Return a normalized output path and reject accidental writes to the input.
+// Existing outputs require an explicit `overwrite: true` argument.
+fn safe_output_path(session: &Session, args: &Value) -> Result<PathBuf, Value> {
+    let raw = required_string(args, "output_path")?;
+    let path = PathBuf::from(&raw);
+    if raw.trim().is_empty() || path.file_name().is_none() {
+        return Err(error("INVALID_ARGUMENT", "output_path must name a file"));
+    }
+    let input = fs::canonicalize(&session.input_path)
+        .map_err(|e| error("IO_ERROR", format!("Cannot resolve input path: {e}")))?;
+    let output_existing = fs::canonicalize(&path).ok();
+    if output_existing.as_ref() == Some(&input) {
+        return Err(error(
+            "UNSAFE_OUTPUT",
+            "output_path must not overwrite the input bundle",
+        ));
+    }
+    if path.exists() && !bool_arg(args, "overwrite", false) {
+        return Err(error(
+            "OUTPUT_EXISTS",
+            "Refusing to replace an existing output; pass overwrite=true explicitly",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(error(
+            "IO_ERROR",
+            format!("Output directory does not exist: {}", parent.display()),
+        ));
+    }
+    Ok(path)
+}
+
+fn standalone_output_path(args: &Value) -> Result<PathBuf, Value> {
+    let raw = required_string(args, "output_path")?;
+    let path = PathBuf::from(&raw);
+    if raw.trim().is_empty() || path.file_name().is_none() {
+        return Err(error("INVALID_ARGUMENT", "output_path must name a file"));
+    }
+    if path.exists() && !bool_arg(args, "overwrite", false) {
+        return Err(error(
+            "OUTPUT_EXISTS",
+            "Refusing to replace an existing output; pass overwrite=true explicitly",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(error(
+            "IO_ERROR",
+            format!("Output directory does not exist: {}", parent.display()),
+        ));
+    }
+    Ok(path)
+}
+
+// Write bytes through a same-directory temporary file, flush/sync them, then
+// rename into place. This prevents a killed Android process from leaving a
+// truncated output bundle. HBC outputs are parsed and footer-checked first.
+fn atomic_write(path: &Path, bytes: &[u8], validate_hbc: bool, overwrite: bool) -> Result<(), Value> {
+    if validate_hbc {
+        if !hbc_decomp::verify_footer(bytes) {
+            return Err(error("VALIDATION_ERROR", "Generated HBC footer verification failed"));
+        }
+        BytecodeFile::parse_auto(bytes)
+            .map_err(|e| error("VALIDATION_ERROR", format!("Generated HBC failed to parse: {e}")))?;
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    let temp = parent.join(format!(".{name}.tmp-{stamp:x}-{counter:x}"));
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| error("IO_ERROR", format!("Cannot create temporary output: {e}")))?;
+        file.write_all(bytes)
+            .map_err(|e| error("IO_ERROR", format!("Cannot write temporary output: {e}")))?;
+        file.sync_all()
+            .map_err(|e| error("IO_ERROR", format!("Cannot sync temporary output: {e}")))?;
+        drop(file);
+
+        if path.exists() && !overwrite {
+            return Err(error("OUTPUT_EXISTS", "Output appeared during the write"));
+        }
+        fs::rename(&temp, path)
+            .map_err(|e| error("IO_ERROR", format!("Cannot atomically install output: {e}")))?;
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn decompile_function(session: &Session, args: &Value) -> Result<Value, Value> {
@@ -362,27 +481,28 @@ fn extract_modules(session: &mut Session, args: &Value) -> Result<Value, Value> 
         .as_ref()
         .ok_or_else(|| error("DECOMPILER_ERROR", "Pipeline was not initialized"))?;
     let directory = Path::new(&output_dir);
-    std::fs::create_dir_all(directory)
+    fs::create_dir_all(directory)
         .map_err(|e| error("IO_ERROR", format!("Failed to create {output_dir}: {e}")))?;
     let mut files = Vec::new();
     for module in pipeline.registry.modules.values() {
         let filename = module
             .name
             .as_deref()
-            .map(|name| name.replace(['/', '\\\\'], "_"))
+            .map(|name| name.replace(['/', '\\'], "_"))
             .map(|name| format!("{}_{}.js", module.module_id, name))
             .unwrap_or_else(|| format!("module_{}.js", module.module_id));
         let mut content = format!(
-            "// Module ID: {}\\n// Function ID: {}\\n",
+            "// Module ID: {}\n// Function ID: {}\n",
             module.module_id, module.function_id
         );
         if let Some(name) = &module.name {
-            content.push_str(&format!("// Name: {name}\\n"));
+            content.push_str(&format!("// Name: {name}\n"));
         }
-        content.push_str(&format!("// Dependencies: {:?}\\n\\n", module.dependencies));
+        content.push_str(&format!("// Dependencies: {:?}\n\n", module.dependencies));
         content.push_str(&pipeline.generate_function_code(&session.file, module.function_id));
-        std::fs::write(directory.join(&filename), content)
-            .map_err(|e| error("IO_ERROR", format!("Failed to write {filename}: {e}")))?;
+        let path = directory.join(&filename);
+        fs::write(&path, content)
+            .map_err(|e| error("IO_ERROR", format!("Failed to write {}: {e}", path.display())))?;
         files.push(filename);
     }
     Ok(ok(json!({"outputDir": output_dir, "count": files.len(), "files": files})))
@@ -390,7 +510,7 @@ fn extract_modules(session: &mut Session, args: &Value) -> Result<Value, Value> 
 
 fn binary_diff(session: &Session, args: &Value) -> Result<Value, Value> {
     let other_path = required_string(args, "other_path")?;
-    let other_bytes = std::fs::read(&other_path)
+    let other_bytes = fs::read(&other_path)
         .map_err(|e| error("IO_ERROR", format!("Failed to read {other_path}: {e}")))?;
     let other_file = BytecodeFile::parse_auto(&other_bytes)
         .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
@@ -401,7 +521,7 @@ fn binary_diff(session: &Session, args: &Value) -> Result<Value, Value> {
         file.function_headers
             .iter()
             .enumerate()
-            .map(|(id, header)| (function_name(file, id), id as u32))
+            .map(|(id, _)| (function_name(file, id), id as u32))
             .collect::<std::collections::BTreeMap<_, _>>()
     };
     let left = names(&session.file);
@@ -519,7 +639,7 @@ fn emit_hasm(session: &Session, args: &Value) -> Result<Value, Value> {
 }
 
 fn patch_string(session: &mut Session, args: &Value) -> Result<Value, Value> {
-    let output_path = required_string(args, "output_path")?;
+    let output_path = safe_output_path(session, args)?;
     let new_value = required_string(args, "new_value")?;
     let mut file = session.file.clone();
     let output = if let Some(id) = optional_u32(args, "id")? {
@@ -541,14 +661,13 @@ fn patch_string(session: &mut Session, args: &Value) -> Result<Value, Value> {
         )
     }
     .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
-    std::fs::write(&output_path, output)
-        .map_err(|e| error("IO_ERROR", format!("Failed to write {output_path}: {e}")))?;
-    Ok(ok(json!({"path": output_path})))
+    atomic_write(&output_path, &output, true, bool_arg(args, "overwrite", false))?;
+    Ok(ok(json!({"path": output_path, "bytes": output.len()})))
 }
 
 fn patch_function(session: &mut Session, args: &Value) -> Result<Value, Value> {
     let function_id = required_u32(args, "function_id")?;
-    let output_path = required_string(args, "output_path")?;
+    let output_path = safe_output_path(session, args)?;
     let hasm = required_string(args, "hasm")?;
     let mut file = session.file.clone();
     let instructions = hbc_decomp::parse_hasm_with_context(&hasm, &session.format, &file)
@@ -561,14 +680,60 @@ fn patch_function(session: &mut Session, args: &Value) -> Result<Value, Value> {
         &hbc_decomp::PatchOptions::default(),
     )
     .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
-    std::fs::write(&output_path, output)
-        .map_err(|e| error("IO_ERROR", format!("Failed to write {output_path}: {e}")))?;
-    Ok(ok(json!({"path": output_path})))
+    atomic_write(&output_path, &output, true, bool_arg(args, "overwrite", false))?;
+    Ok(ok(json!({"path": output_path, "bytes": output.len()})))
+}
+
+fn patch_functions(session: &Session, args: &Value) -> Result<Value, Value> {
+    let edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("INVALID_ARGUMENT", "edits must be an array"))?;
+    if edits.is_empty() {
+        return Err(error("INVALID_ARGUMENT", "edits must not be empty"));
+    }
+    let output_path = safe_output_path(session, args)?;
+    let mut bytes = session
+        .file
+        .raw_bytes
+        .clone()
+        .ok_or_else(|| error("WRITE_ERROR", "Input bundle has no raw bytes"))?;
+    let mut applied = Vec::with_capacity(edits.len());
+    let mut seen = std::collections::BTreeSet::new();
+
+    for (index, edit) in edits.iter().enumerate() {
+        let function_id = required_u32(edit, "function_id")?;
+        if !seen.insert(function_id) {
+            return Err(error(
+                "INVALID_ARGUMENT",
+                format!("Duplicate function_id in edit list: {function_id}"),
+            ));
+        }
+        let hasm = required_string(edit, "hasm")?;
+        let mut file = BytecodeFile::parse_auto(&bytes)
+            .map_err(|e| error("VALIDATION_ERROR", format!("Cannot reparse after edit {index}: {e}")))?;
+        let (format, _) = hbc_decomp::BytecodeFormat::for_version_or_latest(file.header.version)
+            .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
+        let instructions = hbc_decomp::parse_hasm_with_context(&hasm, &format, &file)
+            .map_err(|e| error("INVALID_ARGUMENT", format!("Edit {index}: {e}")))?;
+        bytes = hbc_decomp::patch_function_body(
+            &mut file,
+            &format,
+            function_id,
+            &instructions,
+            &hbc_decomp::PatchOptions::default(),
+        )
+        .map_err(|e| error("WRITE_ERROR", format!("Edit {index}: {e}")))?;
+        applied.push(function_id);
+    }
+
+    atomic_write(&output_path, &bytes, true, bool_arg(args, "overwrite", false))?;
+    Ok(ok(json!({"path": output_path, "bytes": bytes.len(), "functions": applied})))
 }
 
 fn inject_stub(session: &mut Session, args: &Value) -> Result<Value, Value> {
     let function_id = required_u32(args, "function_id")?;
-    let output_path = required_string(args, "output_path")?;
+    let output_path = safe_output_path(session, args)?;
     let kind = match string_arg(args, "kind", "nop").as_str() {
         "nop" => hbc_decomp::InjectStubKind::NopPad,
         "log" => hbc_decomp::InjectStubKind::LogEntry,
@@ -583,13 +748,12 @@ fn inject_stub(session: &mut Session, args: &Value) -> Result<Value, Value> {
         &hbc_decomp::PatchOptions::default(),
     )
     .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
-    std::fs::write(&output_path, output)
-        .map_err(|e| error("IO_ERROR", format!("Failed to write {output_path}: {e}")))?;
-    Ok(ok(json!({"path": output_path})))
+    atomic_write(&output_path, &output, true, bool_arg(args, "overwrite", false))?;
+    Ok(ok(json!({"path": output_path, "bytes": output.len()})))
 }
 
 fn create_file(args: &Value) -> Result<Value, Value> {
-    let output_path = required_string(args, "output_path")?;
+    let output_path = standalone_output_path(args)?;
     let version = args
         .get("version")
         .and_then(Value::as_u64)
@@ -612,9 +776,8 @@ fn create_file(args: &Value) -> Result<Value, Value> {
         strings,
     })
     .map_err(|e| error("WRITE_ERROR", e.to_string()))?;
-    std::fs::write(&output_path, bytes)
-        .map_err(|e| error("IO_ERROR", format!("Failed to write {output_path}: {e}")))?;
-    Ok(ok(json!({"path": output_path, "version": version})))
+    atomic_write(&output_path, &bytes, true, bool_arg(args, "overwrite", false))?;
+    Ok(ok(json!({"path": output_path, "version": version, "bytes": bytes.len()})))
 }
 
 fn frida_hooks(session: &Session, args: &Value) -> Result<Value, Value> {
@@ -640,7 +803,7 @@ fn frida_hooks(session: &Session, args: &Value) -> Result<Value, Value> {
     )
     .map_err(|e| error("DECOMPILER_ERROR", e.to_string()))?;
     let directory = Path::new(&output_dir);
-    std::fs::create_dir_all(directory)
+    fs::create_dir_all(directory)
         .map_err(|e| error("IO_ERROR", format!("Failed to create {output_dir}: {e}")))?;
     for (name, body) in [
         ("before.js", bundle.before_js),
@@ -648,10 +811,19 @@ fn frida_hooks(session: &Session, args: &Value) -> Result<Value, Value> {
         ("agent.js", bundle.agent_js),
         ("run.sh", bundle.run_sh),
     ] {
-        std::fs::write(directory.join(name), body)
+        fs::write(directory.join(name), body)
             .map_err(|e| error("IO_ERROR", format!("Failed to write {name}: {e}")))?;
     }
     Ok(ok(json!({"outputDir": output_dir, "moduleId": module_id})))
+}
+
+fn xrefs_with_kind(session: &Session, args: &Value, kind: &str) -> Result<Value, Value> {
+    let mut forced = args.clone();
+    let object = forced
+        .as_object_mut()
+        .ok_or_else(|| error("INVALID_ARGUMENT", "xref arguments must be a JSON object"))?;
+    object.insert("kind".to_string(), Value::String(kind.to_string()));
+    xrefs(session, &forced)
 }
 
 /// Dispatches the Android-facing command protocol. Arguments are deliberately
@@ -685,8 +857,16 @@ pub fn dispatch(session: Option<&mut Session>, command: &str, arguments: Value) 
             .map(decompile_all)
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
-        "xref" | "search-strings" | "searchStrings" | "search-functions" | "searchFunctions" => session
+        "xref" => session
             .map(|session| xrefs(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "search-strings" | "searchStrings" => session
+            .map(|session| xrefs_with_kind(session, &arguments, "string"))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "search-functions" | "searchFunctions" => session
+            .map(|session| xrefs_with_kind(session, &arguments, "function"))
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
         "graph" | "graphviz" | "getControlFlowGraph" => session
@@ -719,6 +899,10 @@ pub fn dispatch(session: Option<&mut Session>, command: &str, arguments: Value) 
             .unwrap_or_else(|value| value),
         "asm-check" => session
             .map(|session| asm_check(session, &arguments))
+            .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
+            .unwrap_or_else(|value| value),
+        "patch-functions" | "patchFunctions" => session
+            .map(|session| patch_functions(session, &arguments))
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
         "tui" => error("CLI_ONLY", "The terminal UI is not available inside an Android app; use info, modules, disasm, decompile, graphviz, and callgraph instead"),

@@ -22,6 +22,7 @@ object HermesNative {
 
     @JvmStatic external fun nativeVersion(): String
     @JvmStatic external fun nativeOpen(path: String): Long
+    @JvmStatic external fun nativeLastError(): String
     @JvmStatic external fun nativeClose(handle: Long)
     @JvmStatic external fun nativeCall(handle: Long, operation: String, argumentsJson: String): String
 
@@ -48,6 +49,12 @@ object HermesNative {
         outputPath: String,
     ): String
     @JvmStatic external fun closeHermesFile(handle: Long)
+
+    fun openOrThrow(path: String): Long {
+        val handle = openHermesFile(path)
+        check(handle > 0L) { nativeLastError().ifBlank { "Unable to open Hermes bytecode: $path" } }
+        return handle
+    }
 
     /** Generic access to every native command, including future upstream commands. */
     fun call(handle: Long, operation: String, arguments: JSONObject = JSONObject()): JSONObject {
@@ -98,20 +105,32 @@ object HermesNative {
     fun emitHasm(handle: Long, functionId: Int): JSONObject =
         call(handle, "emit-hasm", JSONObject().put("function_id", functionId))
 
-    fun assembleFunction(handle: Long, functionId: Int, hasm: String, outputPath: String): JSONObject =
-        call(handle, "asm", JSONObject()
-            .put("function_id", functionId)
-            .put("hasm", hasm)
-            .put("output_path", outputPath))
+    fun assembleFunction(
+        handle: Long,
+        functionId: Int,
+        hasm: String,
+        outputPath: String,
+        overwrite: Boolean = false,
+    ): JSONObject = call(handle, "asm", JSONObject()
+        .put("function_id", functionId)
+        .put("hasm", hasm)
+        .put("output_path", outputPath)
+        .put("overwrite", overwrite))
 
     fun checkAssembly(handle: Long, functionId: Int): JSONObject =
         call(handle, "asm-check", JSONObject().put("function_id", functionId))
 
-    fun patchStringById(handle: Long, id: Int, newValue: String, outputPath: String): JSONObject =
-        call(handle, "patch-string", JSONObject()
-            .put("id", id)
-            .put("new_value", newValue)
-            .put("output_path", outputPath))
+    fun patchStringById(
+        handle: Long,
+        id: Int,
+        newValue: String,
+        outputPath: String,
+        overwrite: Boolean = false,
+    ): JSONObject = call(handle, "patch-string", JSONObject()
+        .put("id", id)
+        .put("new_value", newValue)
+        .put("output_path", outputPath)
+        .put("overwrite", overwrite))
 
     fun patchString(handle: Long, oldValue: String, newValue: String, outputPath: String): JSONObject =
         call(handle, "patch-string", JSONObject()
@@ -145,10 +164,7 @@ class HermesSession(val path: String) : AutoCloseable {
 
     fun open(): HermesSession {
         check(!isOpen) { "Hermes session is already open" }
-        handle = HermesNative.openHermesFile(path)
-        check(isOpen) {
-            "Unable to open Hermes bytecode. Check the path, ABI, and HBC format: $path"
-        }
+        handle = HermesNative.openOrThrow(path)
         return this
     }
 
@@ -206,12 +222,42 @@ class HermesSession(val path: String) : AutoCloseable {
         HermesNative.binaryDiff(requireHandle(), otherPath)
     fun emitHasm(functionId: Int): JSONObject =
         HermesNative.emitHasm(requireHandle(), functionId)
-    fun assemble(functionId: Int, hasm: String, outputPath: String): JSONObject =
-        HermesNative.assembleFunction(requireHandle(), functionId, hasm, outputPath)
+    fun assemble(
+        functionId: Int,
+        hasm: String,
+        outputPath: String,
+        overwrite: Boolean = false,
+    ): JSONObject = HermesNative.assembleFunction(
+        requireHandle(),
+        functionId,
+        hasm,
+        outputPath,
+        overwrite,
+    )
+
+    fun assembleFunctions(
+        edits: List<Pair<Int, String>>,
+        outputPath: String,
+        overwrite: Boolean = false,
+    ): JSONObject {
+        val rows = JSONArray()
+        edits.forEach { (functionId, hasm) ->
+            rows.put(JSONObject().put("function_id", functionId).put("hasm", hasm))
+        }
+        return call(
+            requireHandle(),
+            "patch-functions",
+            JSONObject().put("edits", rows).put("output_path", outputPath).put("overwrite", overwrite),
+        )
+    }
     fun assemblyCheck(functionId: Int): JSONObject =
         HermesNative.checkAssembly(requireHandle(), functionId)
-    fun patchString(id: Int, newValue: String, outputPath: String): JSONObject =
-        HermesNative.patchStringById(requireHandle(), id, newValue, outputPath)
+    fun patchString(id: Int, newValue: String, outputPath: String, overwrite: Boolean = false): JSONObject =
+        call("patch-string", JSONObject()
+            .put("id", id)
+            .put("new_value", newValue)
+            .put("output_path", outputPath)
+            .put("overwrite", overwrite))
     fun patchString(oldValue: String, newValue: String, outputPath: String): JSONObject =
         HermesNative.patchString(requireHandle(), oldValue, newValue, outputPath)
     fun injectStub(functionId: Int, kind: String = "nop", outputPath: String): JSONObject =

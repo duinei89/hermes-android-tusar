@@ -430,8 +430,32 @@ session.call(
 )
 ```
 
-Write operations create a new output file. Keep the input immutable, validate
-the generated file, and reopen it before querying the modified contents.
+Write operations create a new output file. They reject the input path and refuse
+to replace an existing file unless `overwrite=true` is explicit. Writes are
+validated, written through a same-directory temporary file, synced, and
+atomically renamed into place. Keep the input immutable and reopen the output
+before querying modified contents.
+
+For a production multi-function editor, submit one transaction instead of
+writing repeatedly:
+
+```kotlin
+val edits = JSONArray()
+    .put(JSONObject().put("function_id", 42).put("hasm", edited42))
+    .put(JSONObject().put("function_id", 57).put("hasm", edited57))
+
+val result = session.call(
+    "patch-functions",
+    JSONObject()
+        .put("edits", edits)
+        .put("output_path", outputFile.absolutePath)
+        .put("overwrite", false),
+)
+```
+
+The native layer rejects duplicate IDs, reparses after each edit, validates the
+final footer and HBC structure, and installs the result only after all edits
+succeed. Close the original session and reopen the output for subsequent work.
 
 ## Lifecycle and threading
 
@@ -448,10 +472,9 @@ the generated file, and reopen it before querying the modified contents.
 
 ### `nativeOpen` returns `0`
 
-The current JNI ABI uses `0` for all open failures, including an unreadable
-path, malformed HBC, and unsupported format. The native API does not currently
-expose a detailed open-error string, so inspect the path and file with the
-standalone upstream CLI when you need a diagnostic.
+Open failures return `0`. Call `HermesNative.nativeLastError()` immediately
+before another open attempt to obtain the diagnostic, such as an unreadable
+path, malformed HBC, or unsupported version.
 
 Check that:
 

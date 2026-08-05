@@ -34,7 +34,7 @@ or HASM; they do not turn decompiled JavaScript back into a bundle.
 | Read | `info`, `list-functions`, `disasm`, `decompile`, `decompile-full`, `decompile-all`, `extract`, `modules`, `deps` |
 | Analyze | `xref`, `search-strings`, `search-functions`, `graphviz`, `callgraph`, `closures`, `debug`, `dump`, `dump-table`, `bin-diff` |
 | RE helpers | `secrets`, `frida-hooks` |
-| Bytecode writing | `emit-hasm`, `asm`, `asm-check`, `patch-string`, `patch-function`, `inject-stub`, `create` |
+| Bytecode writing | `emit-hasm`, `asm`, `asm-check`, `patch-string`, `patch-function`, `patch-functions`, `inject-stub`, `create` |
 | CLI-only | `tui` returns a structured `CLI_ONLY` error; use the equivalent JSON operations in Android |
 
 The complete protocol, argument schema, examples, and agent guidance are in:
@@ -164,7 +164,9 @@ Failed calls return:
 ```
 
 The main error codes are `INVALID_HANDLE`, `INVALID_ARGUMENT`, `INVALID_JSON`,
-`DECOMPILER_ERROR`, `WRITE_ERROR`, and `IO_ERROR`.
+`DECOMPILER_ERROR`, `WRITE_ERROR`, `IO_ERROR`, `OUTPUT_EXISTS`, `UNSAFE_OUTPUT`,
+`VALIDATION_ERROR`, and `PANIC`. A failed open returns handle `0`; call
+`nativeLastError()` immediately afterward for a diagnostic.
 
 ## Full-pipeline behavior
 
@@ -182,13 +184,35 @@ results can be very large; prefer function- or module-level calls and write
 large returned strings to a file from Kotlin instead of displaying them all at
 once.
 
-## Important write-path behavior
+## Production-safe write behavior
 
-Write operations always require an explicit output path. They produce a new HBC
-file and do not silently overwrite the input. The current bridge clones the
-session's parsed file for the write, so the open session continues to represent
-the original input. Close and reopen the output file before analyzing a patched
-image.
+Write operations require an explicit output path and refuse to overwrite an
+existing file unless `overwrite=true` is passed. They always reject the input
+bundle itself as the output. HBC outputs are footer-checked and reparsed before
+being installed.
+
+Writes use a same-directory temporary file, flush and sync its contents, then
+atomically rename it into place. A failed write cleans up the temporary file and
+leaves the destination unchanged. Keep outputs in an app-controlled directory;
+the Android host should enforce its own output-root policy as well.
+
+For several edited functions, use `patch-functions` in one request:
+
+```json
+{
+  "edits": [
+    {"function_id": 42, "hasm": "..."},
+    {"function_id": 57, "hasm": "..."}
+  ],
+  "output_path": "/data/user/0/app/files/patched.hbc",
+  "overwrite": false
+}
+```
+
+The operation rejects duplicate function IDs, reparses after each edit, and
+only installs the final output after validation. The open session remains tied
+to the original input; close it and reopen the generated bundle before further
+edits or analysis.
 
 Use write operations only on bytecode you are authorized to inspect or modify.
 Keep original files and verify every generated HBC before deploying it.

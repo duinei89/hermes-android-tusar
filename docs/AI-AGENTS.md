@@ -121,9 +121,10 @@ portable.
 | `hermes_dump_table` | `kind` | `json` | Text or JSON |
 | `hermes_secret_scan` | none | `show_full` | Redacted report |
 | `hermes_emit_hasm` | `function_id` | none | HASM text |
-| `hermes_patch_string` | `new_value`, `output_path` and either `id` or `old_value` | none | Output path |
-| `hermes_patch_function` | `function_id`, `hasm`, `output_path` | none | Output path |
-| `hermes_inject_stub` | `function_id`, `output_path` | `kind` (`nop`/`log`) | Output path |
+| `hermes_patch_string` | `new_value`, `output_path` and either `id` or `old_value` | `overwrite` | Validated output path |
+| `hermes_patch_function` | `function_id`, `hasm`, `output_path` | `overwrite` | Validated output path |
+| `hermes_patch_functions` | `edits`, `output_path` | `overwrite` | Transactionally validated output path |
+| `hermes_inject_stub` | `function_id`, `output_path` | `kind` (`nop`/`log`), `overwrite` | Validated output path |
 | `hermes_create` | `output_path` | `version`, `strings` | Output path and version |
 | `hermes_frida_hooks` | `module_id`, `output_dir` | `exports` | Output directory |
 | `hermes_versions` | none | none | Supported versions |
@@ -443,6 +444,26 @@ By old value:
 }
 ```
 
+### `patch-functions`
+
+Use one transaction for multiple function edits. Each edit must contain a
+unique `function_id` and its complete HASM body:
+
+```json
+{
+  "edits": [
+    {"function_id": 42, "hasm": "..."},
+    {"function_id": 57, "hasm": "..."}
+  ],
+  "output_path": "/data/user/0/app/files/patched.hbc",
+  "overwrite": false
+}
+```
+
+The native layer reparses after every edit, rejects duplicate IDs, validates the
+final HBC footer and parser structure, and atomically installs the output only
+after the complete transaction succeeds.
+
 ### `patch-function`
 
 Arguments:
@@ -544,6 +565,10 @@ or tamper with third-party apps without authorization.
 - `INVALID_HANDLE`: reopen the input and retry once.
 - `INVALID_JSON`: regenerate arguments from a typed schema.
 - `INVALID_ARGUMENT`: correct the exact field or operation.
+- `OUTPUT_EXISTS`: choose a new path or explicitly set `overwrite=true`.
+- `UNSAFE_OUTPUT`: never write over the input bundle.
+- `VALIDATION_ERROR`: discard the output and preserve the original.
+- `PANIC`: retry only after reporting the operation context; no output should be used.
 - `DECOMPILER_ERROR`: report the HBC version/function/module context; do not
   silently substitute an unrelated result.
 - `WRITE_ERROR` or `IO_ERROR`: preserve the original and report the output path.
@@ -589,7 +614,10 @@ input. Reopen only after a write operation or when switching input files.
 - JNI returns text as a Java `String`; very large results can create memory
   pressure. Add host-side size limits and prefer targeted operations.
 - Write support edits HBC/HASM and does not recompile JavaScript.
-- The current session remains attached to the original input after a write.
+- HBC writes are footer-checked, reparsed, and installed through a same-directory temporary file.
+- Existing outputs require explicit `overwrite=true`; the input bundle is always rejected.
+- `nativeOpen`/`openHermesFile` return zero on failure; call `nativeLastError()` immediately for diagnostics.
+- The current session remains attached to the original input after a write; reopen the output for further work.
 
 ## Provenance
 
