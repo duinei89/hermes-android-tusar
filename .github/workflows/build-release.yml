@@ -1,0 +1,286 @@
+name: Build libtusar.so
+
+on:
+  workflow_dispatch:
+
+  # Check upstream automatically every hour.
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-libtusar
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    name: Check upstream hermes-decomp
+    runs-on: ubuntu-latest
+
+    outputs:
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+
+    steps:
+      - name: Find latest upstream commit
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          upstream_sha="$(
+            git ls-remote \
+              https://github.com/SymbioticSec/hermes-decomp.git \
+              refs/heads/main |
+              awk '{print $1}'
+          )"
+
+          if [ -z "$upstream_sha" ]; then
+            echo "Could not find upstream commit."
+            exit 1
+          fi
+
+          release_tag="upstream-${upstream_sha}"
+
+          if gh release view "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_build="false"
+            echo "Release already exists: $release_tag"
+          else
+            should_build="true"
+            echo "New upstream commit detected: $upstream_sha"
+          fi
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Android libraries
+    needs: check-upstream
+
+    if: needs.check-upstream.outputs.should_build == 'true'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout hermes-android-tusar
+        uses: actions/checkout@v4
+
+      - name: Install Rust and Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "ndk;26.3.11579264"
+
+      - name: Set Android NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Create Cargo.lock
+        run: cargo generate-lockfile
+
+      - name: Pin hbc-decomp to the detected upstream commit
+        env:
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+        run: |
+          cargo update \
+            -p hbc-decomp \
+            --precise "$UPSTREAM_SHA"
+
+      - name: Build Rust workspace tests
+        run: cargo test --workspace
+
+      - name: Build libtusar.so for all ABIs
+        run: |
+          rm -rf jniLibs
+          mkdir -p jniLibs
+
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -t x86_64 \
+            -t x86 \
+            -o "$GITHUB_WORKSPACE/jniLibs" \
+            build \
+            --release \
+            --locked \
+            -p tusar
+
+      - name: Verify generated files
+        run: |
+          set -euo pipefail
+
+          echo "Generated libraries:"
+          find jniLibs -type f -name "libtusar.so" -print
+
+          test -f jniLibs/arm64-v8a/libtusar.so
+          test -f jniLibs/armeabi-v7a/libtusar.so
+          test -f jniLibs/x86_64/libtusar.so
+          test -f jniLibs/x86/libtusar.so
+
+      - name: Create manifest
+        env:
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+        run: |
+          cat > manifest.json <<EOF
+          {
+            "project": "hermes-android-tusar",
+            "library": "libtusar.so",
+            "upstream_repository": "https://github.com/SymbioticSec/hermes-decomp",
+            "upstream_commit": "$UPSTREAM_SHA",
+            "android_ndk": "26.3.11579264",
+            "architectures": [
+              "arm64-v8a",
+              "armeabi-v7a",
+              "x86_64",
+              "x86"
+            ]
+          }
+          EOF
+
+      - name: Prepare release files
+        env:
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+
+          cp jniLibs/arm64-v8a/libtusar.so \
+            release-assets/libtusar-arm64-v8a.so
+
+          cp jniLibs/armeabi-v7a/libtusar.so \
+            release-assets/libtusar-armeabi-v7a.so
+
+          cp jniLibs/x86_64/libtusar.so \
+            release-assets/libtusar-x86_64.so
+
+          cp jniLibs/x86/libtusar.so \
+            release-assets/libtusar-x86.so
+
+          cp manifest.json release-assets/
+
+          (
+            cd release-assets
+            sha256sum * > SHA256SUMS
+          )
+
+          zip -r \
+            "release-assets/libtusar-android-${UPSTREAM_SHA}.zip" \
+            jniLibs \
+            manifest.json
+
+      - name: Download upstream history
+        run: |
+          git clone \
+            --filter=blob:none \
+            https://github.com/SymbioticSec/hermes-decomp.git \
+            /tmp/hermes-decomp
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_subject="$(
+            git -C /tmp/hermes-decomp \
+              show -s --format='%s' "$UPSTREAM_SHA"
+          )"
+
+          upstream_date="$(
+            git -C /tmp/hermes-decomp \
+              show -s --format='%cI' "$UPSTREAM_SHA"
+          )"
+
+          previous_tag="$(
+            gh release list \
+              --repo "$GITHUB_REPOSITORY" \
+              --limit 100 \
+              --json tagName,publishedAt \
+              --jq '
+                [.[] |
+                select(.tagName | startswith("upstream-"))] |
+                sort_by(.publishedAt) |
+                reverse |
+                .[0].tagName // empty
+              '
+          )"
+
+          {
+            echo "# libtusar.so Android build"
+            echo
+            echo "Automated build from the latest upstream Hermes decompiler commit."
+            echo
+            echo "## Upstream"
+            echo
+            echo "- Repository: https://github.com/SymbioticSec/hermes-decomp"
+            echo "- Commit: [$UPSTREAM_SHA](https://github.com/SymbioticSec/hermes-decomp/commit/$UPSTREAM_SHA)"
+            echo "- Date: $upstream_date"
+            echo "- Commit message: $upstream_subject"
+            echo
+            echo "## Included ABIs"
+            echo
+            echo "- arm64-v8a"
+            echo "- armeabi-v7a"
+            echo "- x86_64"
+            echo "- x86"
+            echo
+            echo "## Files"
+            echo
+            echo "- libtusar-arm64-v8a.so"
+            echo "- libtusar-armeabi-v7a.so"
+            echo "- libtusar-x86_64.so"
+            echo "- libtusar-x86.so"
+            echo "- SHA256SUMS"
+            echo "- manifest.json"
+            echo "- Android ZIP archive"
+            echo
+
+            if [ -n "$previous_tag" ]; then
+              previous_sha="${previous_tag#upstream-}"
+
+              echo "## Upstream commits since the previous release"
+              echo
+
+              git -C /tmp/hermes-decomp log \
+                --format='- %h %s' \
+                "$previous_sha..$UPSTREAM_SHA" || true
+            else
+              echo "This is the first automated upstream release."
+            fi
+          } > release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "libtusar.so - upstream ${UPSTREAM_SHA:0:12}" \
+            --notes-file release-notes.md \
+            release-assets/*
