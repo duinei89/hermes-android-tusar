@@ -29,7 +29,7 @@ fn store() -> &'static SessionStore {
     STORE.get_or_init(SessionStore::new)
 }
 
-fn make_string(mut env: JNIEnv, text: String) -> jstring {
+fn make_string(env: JNIEnv, text: String) -> jstring {
     match env.new_string(text) {
         Ok(value) => value.into_raw(),
         Err(_) => std::ptr::null_mut(),

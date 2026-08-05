@@ -882,7 +882,7 @@ pub fn dispatch(session: Option<&mut Session>, command: &str, arguments: Value) 
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
         "debug" | "debug-info" => session
-            .map(debug_info)
+            .map(|session| debug_info(&*session))
             .unwrap_or_else(|| Err(error("INVALID_HANDLE", "A session is required")))
             .unwrap_or_else(|value| value),
         "extract" => session
