@@ -1,6 +1,8 @@
+use hbc_decomp::{BytecodeFile, BytecodeFormat, DecompileOptionsV2, PipelineContext};
 use parking_lot::RwLock;
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -9,13 +11,26 @@ use std::{
 
 pub struct Session {
     pub input_path: String,
+    pub bytes: Vec<u8>,
+    pub file: BytecodeFile,
+    pub format: BytecodeFormat,
+    pub pipeline_ctx: Option<PipelineContext>,
+}
 
-    // Add the real parsed hbc-decomp state here after verifying
-    // the exact upstream types and constructors.
-    //
-    // Example only:
-    // pub bytecode: BytecodeFile,
-    // pub context: PipelineContext,
+impl Session {
+    pub fn ensure_pipeline(&mut self) -> hbc_decomp::Result<()> {
+        if self.pipeline_ctx.is_none() {
+            let cache_path = hbc_decomp::default_cache_path(Path::new(&self.input_path));
+            self.pipeline_ctx = Some(PipelineContext::build_cached(
+                &self.file,
+                &self.format,
+                &DecompileOptionsV2::optimized(),
+                &self.bytes,
+                &cache_path,
+            )?);
+        }
+        Ok(())
+    }
 }
 
 pub struct SessionStore {
@@ -33,11 +48,9 @@ impl SessionStore {
 
     pub fn insert(&self, session: Session) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
         self.sessions
             .write()
             .insert(id, Arc::new(RwLock::new(session)));
-
         id
     }
 

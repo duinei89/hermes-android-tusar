@@ -3,9 +3,9 @@ name: Build libtusar.so
 on:
   workflow_dispatch:
 
-  # Check upstream automatically every hour.
+  # Check upstream automatically once per day at 03:17 UTC.
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 3 * * *"
 
 permissions:
   contents: write
@@ -185,10 +185,20 @@ jobs:
             sha256sum * > SHA256SUMS
           )
 
-          zip -r \
-            "release-assets/libtusar-android-${UPSTREAM_SHA}.zip" \
-            jniLibs \
-            manifest.json
+          mkdir -p archive/jniLibs/arm64-v8a archive/jniLibs/armeabi-v7a archive/jniLibs/x86_64 archive/jniLibs/x86
+          cp jniLibs/arm64-v8a/libtusar.so archive/jniLibs/arm64-v8a/
+          cp jniLibs/armeabi-v7a/libtusar.so archive/jniLibs/armeabi-v7a/
+          cp jniLibs/x86_64/libtusar.so archive/jniLibs/x86_64/
+          cp jniLibs/x86/libtusar.so archive/jniLibs/x86/
+          cp manifest.json archive/
+
+          (
+            cd archive
+            zip -r \
+              "../release-assets/libtusar-android-${UPSTREAM_SHA}.zip" \
+              jniLibs \
+              manifest.json
+          )
 
       - name: Download upstream history
         run: |
@@ -256,7 +266,7 @@ jobs:
             echo "- libtusar-x86.so"
             echo "- SHA256SUMS"
             echo "- manifest.json"
-            echo "- Android ZIP archive"
+            echo "- libtusar-android-${UPSTREAM_SHA}.zip (jniLibs-ready archive)"
             echo
 
             if [ -n "$previous_tag" ]; then
